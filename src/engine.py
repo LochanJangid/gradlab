@@ -1,5 +1,8 @@
+import math
+import numpy as np
+
 class Value:
-    def __init__(self, data: int, label=''):
+    def __init__(self, data, label=''):
         self.data = data
         self.grad = 0.0
         self.label = label
@@ -95,6 +98,7 @@ class Value:
                 self.grad += 1.0
         out._backward = _backward
         return out
+
 
     def backward(self):
         tapolo = []
