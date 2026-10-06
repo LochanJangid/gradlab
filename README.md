@@ -1,6 +1,6 @@
 ﻿# Gradlab
 
-## here i do experiments with neural networks.
+## here i do experiments with neural networks & transformers.
 
 ## learning from [Andrej Karpathy](https://github.com/karpathy)  "Zero to Hero" deep learning series. 
 
