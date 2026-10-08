@@ -18,10 +18,8 @@ dropout = 0.2 # nn.Dropout(dropout) think dropout as regularization technique wh
 # --------------------------------
 
 # Get the data
-text = open("/kaggle/input/datasets/lochanjangid/shakes-pear-input-txt-for-nano-gpt/input.txt", "r", encoding="utf-8").read()
-n90 = int(len(text) * 0.90)
-train_set = text[:n90]
-val_set = text[n90:]
+text = open("input.txt", "r", encoding="utf-8").read()
+
 
 # make tokens
 itos = {token: ch for token, ch in enumerate(sorted(list(set(text))))}
@@ -30,13 +28,20 @@ vocab_size = len(itos)
 encode = lambda x: torch.tensor([stoi[ch] for ch in x])
 decode = lambda x: "".join([itos[token.item()] for token in x])
 
+# Encode everything once safe computation
+data_all = encode(text)
+n90 = int(len(text) * 0.90)
+train_set = data_all[:n90]
+val_set = data_all[n90:]
+
 # Helper function
 def get_data(type="train"):
     data = train_set if type == "train" else val_set
     idxs = torch.randint(len(data)-context_size-1, (batch_size, ))
-    x = torch.stack([encode(data[idx:idx+context_size]) for idx in idxs])
-    y = torch.stack([encode(data[idx+1:idx+context_size+1]) for idx in idxs])
-
+    offsets = torch.arange(context_size)
+    x = data[idxs.unsqueeze(dim=1) + offsets]
+    y = data[idxs.unsqueeze(dim=1) + offsets + 1]
+    
     return x.to(device), y.to(device)
 
 # make a single head attention
@@ -47,7 +52,8 @@ class Head(nn.Module):
         self.query = nn.Linear(n_emb, head_size, bias=False)
         self.key = nn.Linear(n_emb, head_size, bias=False)
         self.value = nn.Linear(n_emb, head_size, bias=False)
-        self.tril = torch.tril(torch.ones(context_size, context_size, device=device))
+        # self.tril = torch.tril(torch.ones(context_size, context_size, device=device))
+        self.register_buffer("tril", torch.tril(torch.ones(context_size, context_size))) #  it's good to save in buffer so it will add into state_dict and no need to explicitly say device=device
         self.dropout = nn.Dropout(dropout)
     # Attention to shapes :p
     # tril - context_size, context_size
@@ -66,7 +72,7 @@ class Head(nn.Module):
         wei = Q @ k.transpose(-2, -1) * self.head_size ** -0.5
         
         wei = torch.masked_fill(wei, self.tril[:T, :T] == 0, float("-inf")) # [:T, :T] is for slice to the current length and be flexible to T <= context_length
-        wei = F.softmax(wei, dim=1)
+        wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
         xbow = wei @ v
         return xbow
@@ -84,7 +90,65 @@ class MultiHeadAttention(nn.Module):
         x = self.proj(out)
         x = self.dropout(x)
         return x
+
+
+# Head + MultiHeadAttention --> Run multiple heads in parallel so the computation will become fast and great use of GPU | i don't have one just using kaggle notebooks:p
+class ParallelHeadAttention(nn.Module):
+    def __init__(self, n_emb, n_head):
+        super().__init__()
+        # RULE: C = head_size * n_head (Everytime don't matter how they run) in our transformer C is n_emb
+        self.nh = n_head # number of heads
+        self.hs = n_emb//n_head # head size
+
+        self.query = nn.Linear(n_emb, self.nh*self.hs, bias=False) # self.nh*self = n_emb (just for understanding what we are doing...)
+        self.key = nn.Linear(n_emb, self.nh*self.hs, bias=False)
+        self.value = nn.Linear(n_emb, self.nh*self.hs, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(context_size, context_size)))
+        self.proj = nn.Linear(n_emb, n_emb, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    # ! Please give some attention to shapes  hahahahahahahahahaha Very Complicated but that's fun :p
+    # x - B, T, C
+    # Q - Shapes step by step
+    #    B, T, C # first shape
+    #    B, T, nh, hs # split C into nh, hs 
+    #    B, nh, T, hs # make nh higher dimension because of matrix multiplication (in pytorch matrix multiplication consider last 2 dimensions)
+    # k - 
+    #    B, T, C -> B, T, nh, hs -> B, nh, T, hs # just same as Q
+    #    B, nh, hs, T # transposed shape of k for `Q @ k.T`  [use k.transpose(-1, -2)]
+    # v - 
+    #    B, T, C -> B, T, nh, hs -> B, nh, T, hs # just same as Q but it is good for (wei @ v) becauzeeeee.... see out shapes :)
+    # wei = Q * k.T - (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
+    # out = wei @ v - (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    # Reassemble the head back so change shape of out to get back out main shape to stay consistant in shape
+    # out - (B, nh, T, hs) -> (B, T, nh, hs) -> (B, T, nh*hs) that is also identical to (B, T, C)
     
+    def forward(self, x):
+        B, T, C = x.shape
+
+        Q = self.query(x) # B, T, C
+        Q = Q.view(B, T, self.nh, self.hs) # B, T, nh, hs
+        Q = Q.transpose(1, 2) # B, nh, T, hs
+
+        k = self.key(x).view(B, T, self.nh, self.hs) 
+        k = k.transpose(1, 2)
+
+        v = self.value(x).view(B, T, self.nh, self.hs)
+        v = v.transpose(1, 2)
+
+        wei = Q @ k.transpose(-1, -2) * self.hs ** -0.5 # B, nh, T, T
+        # Masking and averaging (if you know you know)
+        wei = torch.masked_fill(wei, self.tril[:T, :T] == 0, float("-inf"))
+        wei = torch.softmax(wei, dim=-1)
+        wei = self.dropout(wei) # faaaaaaaaaaaaaaa
+
+        out = wei @ v # B, nh, T, hs
+        out = out.transpose(1, 2) # B, T, nh, hs
+        out = out.contiguous().view(B, T, self.nh*self.hs) # B, T, nh*hs # used contiguous() becauze after transpose we can't do view directly becauze transpose return non-contiguous tensor 
+
+        out = self.proj(out)        
+        out = self.dropout(out)
+        return out      
 
 # Feed-Forward just MLP - it gives the space or time to think about collected information
 # now tokens think individually on learnt information
@@ -105,9 +169,10 @@ class FeedForward(nn.Module):
 # Make a block of transformer where we have communication with computation
 # means communication (multi head attention) + computation (feed forward)
 class Block(nn.Module):
-    def __init__(self, n_emb, head_size):
+    def __init__(self, n_emb, n_head):
         super().__init__()
-        self.head = MultiHeadAttention(head_size, n_emb//head_size)
+        # self.head = MultiHeadAttention(head_size, n_emb//head_size)
+        self.head = ParallelHeadAttention(n_emb, n_head)
         self.ffd = FeedForward(n_emb, n_emb)
         self.ln1 = nn.LayerNorm(n_emb)
         self.ln2 = nn.LayerNorm(n_emb)
@@ -132,7 +197,7 @@ class BigramLanguageModel(nn.Module):
         # self.ma_head = MultiHeadAttention(4, n_emb//4) # Multi Attention Head
         # self.ffd = FeedForward(n_emb, n_emb) # Feed forward (Linear + Relu)
 
-        self.blocks = nn.Sequential(*[Block(n_emb, head_size) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(n_emb, n_head) for _ in range(n_layer)])
         self.ln_f =    nn.LayerNorm(n_emb) # final layernorm: a another layer normalization before going outside of transformer block
         self.lm_head = nn.Linear(n_emb, vocab_size)
         
@@ -149,7 +214,7 @@ class BigramLanguageModel(nn.Module):
         # xbow = self.ma_head(x)
         # xact = self.ffd(xbow)
         x = self.blocks(x)
-
+        x = self.ln_f(x)
         logits = self.lm_head(x) # B, T, C=n_emb -----Linear Layer----->  B, T, C=vocab_size 
 
 
@@ -165,8 +230,10 @@ class BigramLanguageModel(nn.Module):
 
         return logits, loss
 
+    @torch.no_grad()
     def generate(self, idx, max_new_tokens):
         # idx - B, T            max_new_tokesn - int
+        self.eval()
         for _ in range(max_new_tokens):
             # crop context to max context size
             idx_cond = idx[:, -context_size:]
@@ -177,6 +244,7 @@ class BigramLanguageModel(nn.Module):
             probs = F.softmax(logits, dim=1) # B, C
             new_idx = torch.multinomial(probs, num_samples=1) # 1, 
             idx = torch.cat([idx, new_idx], dim=1) # B, T+1
+        self.train()
         return idx
 
 # Function for finding estimate loss on another more samples so we will not distracted by noisy batches false losses
@@ -207,7 +275,7 @@ for i in range(max_iter):
     # get metric about model once in a while
     if i % eval_interval == 0:
         losses = estimate_loss(m)
-        print(f"Step {i}: Train Loss {losses["train"]:.4f} Val Loss {losses["val"]:.4f}")
+        print(f"Step {i}: Train Loss {losses['train']:.4f} Val Loss {losses['val']:.4f}")
 
     # forward pass    
     x, y = get_data("train")
